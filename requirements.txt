@@ -1,7 +1,6 @@
 PyQt6>=6.6
-pynput>=1.7                        # global keyboard capture (works when unfocused)
 
-# macOS only — needed so the app can detect/request the Accessibility permission
-# and float above fullscreen apps. Harmless to install elsewhere but Mac-specific.
+# macOS only — Accessibility trust check, CGEventTap, and floating above fullscreen.
+# Harmless to install elsewhere but Mac-specific.
 pyobjc-framework-ApplicationServices>=9.0 ; sys_platform == "darwin"
 pyobjc-framework-Cocoa>=9.0 ; sys_platform == "darwin"

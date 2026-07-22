@@ -16,6 +16,9 @@ Cross-platform (Windows / macOS / Linux). Build a standalone binary with PyInsta
 import sys
 import json
 import os
+import threading
+import ctypes
+from ctypes import wintypes
 
 from PyQt6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QLabel,
@@ -455,50 +458,258 @@ def style_button(btn):
 
 # ----------------------------------------------------------------------------
 # Global keyboard listener (works even when the app is NOT focused).
-# Uses pynput on a background thread; forwards keys to the UI via a Qt signal
-# (thread-safe). If pynput is missing or the OS denies access, the app falls
-# back to focus-only key handling.
+# Native OS hooks on Windows/macOS; Linux falls back to focus-only handling.
+# All hook callbacks emit key_pressed(int) — thread-safe via pyqtSignal.
 # ----------------------------------------------------------------------------
-def _build_char_to_qt():
-    """Map single characters to Qt key codes for letters, digits, punctuation."""
-    m = {}
-    for c in "abcdefghijklmnopqrstuvwxyz":
-        m[c] = getattr(Qt.Key, f"Key_{c.upper()}")
-    for d in "0123456789":
-        m[d] = getattr(Qt.Key, f"Key_{d}")
-    punct = {
-        ";": Qt.Key.Key_Semicolon, ",": Qt.Key.Key_Comma, ".": Qt.Key.Key_Period,
-        "/": Qt.Key.Key_Slash, "'": Qt.Key.Key_Apostrophe, "[": Qt.Key.Key_BracketLeft,
-        "]": Qt.Key.Key_BracketRight, "-": Qt.Key.Key_Minus, "=": Qt.Key.Key_Equal,
-        "\\": Qt.Key.Key_Backslash, "`": Qt.Key.Key_QuoteLeft, " ": Qt.Key.Key_Space,
-    }
-    m.update(punct)
-    return m
+
+def _build_mac_keycode_to_qt():
+    """Map macOS hardware key codes (HIToolbox kVK_*) to Qt.Key."""
+    pairs = [
+        (0, Qt.Key.Key_A), (1, Qt.Key.Key_S), (2, Qt.Key.Key_D), (3, Qt.Key.Key_F),
+        (4, Qt.Key.Key_H), (5, Qt.Key.Key_G), (6, Qt.Key.Key_Z), (7, Qt.Key.Key_X),
+        (8, Qt.Key.Key_C), (9, Qt.Key.Key_V), (11, Qt.Key.Key_B), (12, Qt.Key.Key_Q),
+        (13, Qt.Key.Key_W), (14, Qt.Key.Key_E), (15, Qt.Key.Key_R), (16, Qt.Key.Key_Y),
+        (17, Qt.Key.Key_T), (18, Qt.Key.Key_1), (19, Qt.Key.Key_2), (20, Qt.Key.Key_3),
+        (21, Qt.Key.Key_4), (22, Qt.Key.Key_6), (23, Qt.Key.Key_5), (24, Qt.Key.Key_Equal),
+        (25, Qt.Key.Key_9), (26, Qt.Key.Key_7), (27, Qt.Key.Key_Minus), (28, Qt.Key.Key_8),
+        (29, Qt.Key.Key_0), (30, Qt.Key.Key_BracketRight), (31, Qt.Key.Key_O),
+        (32, Qt.Key.Key_U), (33, Qt.Key.Key_BracketLeft), (34, Qt.Key.Key_I),
+        (35, Qt.Key.Key_P), (36, Qt.Key.Key_Return), (37, Qt.Key.Key_L),
+        (38, Qt.Key.Key_J), (39, Qt.Key.Key_Apostrophe), (40, Qt.Key.Key_K),
+        (41, Qt.Key.Key_Semicolon), (42, Qt.Key.Key_Backslash), (43, Qt.Key.Key_Comma),
+        (44, Qt.Key.Key_Slash), (45, Qt.Key.Key_N), (46, Qt.Key.Key_M),
+        (47, Qt.Key.Key_Period), (48, Qt.Key.Key_Tab), (49, Qt.Key.Key_Space),
+    ]
+    return dict(pairs)
 
 
-_CHAR_TO_QT = _build_char_to_qt()
+_MAC_KEYCODE_TO_QT = _build_mac_keycode_to_qt()
+
+_WIN_VK_TO_QT = {
+    0x20: Qt.Key.Key_Space,
+    0x0D: Qt.Key.Key_Return,
+    0x09: Qt.Key.Key_Tab,
+    0xBA: Qt.Key.Key_Semicolon,
+    0xBB: Qt.Key.Key_Equal,
+    0xBC: Qt.Key.Key_Comma,
+    0xBD: Qt.Key.Key_Minus,
+    0xBE: Qt.Key.Key_Period,
+    0xBF: Qt.Key.Key_Slash,
+    0xC0: Qt.Key.Key_QuoteLeft,
+    0xDB: Qt.Key.Key_BracketLeft,
+    0xDC: Qt.Key.Key_Backslash,
+    0xDD: Qt.Key.Key_BracketRight,
+    0xDE: Qt.Key.Key_Apostrophe,
+}
+
+
+def _win_vk_to_qt(vk):
+    """Convert a Windows virtual-key code to Qt.Key, or None if unmapped."""
+    if 0x41 <= vk <= 0x5A:
+        return getattr(Qt.Key, f"Key_{chr(vk)}")
+    if 0x30 <= vk <= 0x39:
+        return getattr(Qt.Key, f"Key_{chr(vk)}")
+    return _WIN_VK_TO_QT.get(vk)
+
+
+def _mac_keycode_to_qt(keycode):
+    """Convert a macOS hardware key code to Qt.Key, or None if unmapped."""
+    return _MAC_KEYCODE_TO_QT.get(int(keycode))
+
+
+if sys.platform == "win32":
+    _WH_KEYBOARD_LL = 13
+    _WM_KEYDOWN = 0x0100
+    _WM_SYSKEYDOWN = 0x0104
+    _WM_QUIT = 0x0012
+
+    class _KBDLLHOOKSTRUCT(ctypes.Structure):
+        _fields_ = [
+            ("vkCode", wintypes.DWORD),
+            ("scanCode", wintypes.DWORD),
+            ("flags", wintypes.DWORD),
+            ("time", wintypes.DWORD),
+            ("dwExtraInfo", ctypes.c_size_t),
+        ]
+
+    _LowLevelKeyboardProc = ctypes.WINFUNCTYPE(
+        ctypes.c_long, ctypes.c_int, wintypes.WPARAM, wintypes.LPARAM,
+    )
+
+
+class _WindowsKeyHook:
+    """Low-level keyboard hook (WH_KEYBOARD_LL) on a daemon thread with a message loop."""
+
+    def __init__(self, on_key):
+        self._on_key = on_key
+        self._hook_id = None
+        self._thread = None
+        self._thread_id = None
+        self._proc = None
+        self._started = threading.Event()
+        self._error = None
+        self._user32 = ctypes.windll.user32
+        self._kernel32 = ctypes.windll.kernel32
+
+    def start(self):
+        self._thread = threading.Thread(target=self._run, name="WinKeyHook", daemon=True)
+        self._thread.start()
+        if not self._started.wait(timeout=3.0):
+            raise RuntimeError("Windows keyboard hook thread did not start in time")
+        if self._error is not None:
+            raise self._error
+
+    def _run(self):
+        self._thread_id = self._kernel32.GetCurrentThreadId()
+
+        @_LowLevelKeyboardProc
+        def hook_proc(n_code, w_param, l_param):
+            if n_code >= 0 and w_param in (_WM_KEYDOWN, _WM_SYSKEYDOWN):
+                kb = ctypes.cast(l_param, ctypes.POINTER(_KBDLLHOOKSTRUCT)).contents
+                qt_key = _win_vk_to_qt(kb.vkCode)
+                if qt_key is not None:
+                    self._on_key(int(qt_key))
+            return self._user32.CallNextHookEx(None, n_code, w_param, l_param)
+
+        self._proc = hook_proc
+        module = self._kernel32.GetModuleHandleW(None)
+        self._hook_id = self._user32.SetWindowsHookExW(
+            _WH_KEYBOARD_LL, self._proc, module, 0,
+        )
+        if not self._hook_id:
+            self._error = ctypes.WinError()
+            self._started.set()
+            return
+
+        self._started.set()
+        msg = wintypes.MSG()
+        while self._user32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
+            self._user32.TranslateMessage(ctypes.byref(msg))
+            self._user32.DispatchMessageW(ctypes.byref(msg))
+
+        if self._hook_id:
+            self._user32.UnhookWindowsHookEx(self._hook_id)
+            self._hook_id = None
+
+    def stop(self):
+        if self._thread_id:
+            self._user32.PostThreadMessageW(self._thread_id, _WM_QUIT, 0, 0)
+        if self._thread is not None and self._thread.is_alive():
+            self._thread.join(timeout=2.0)
+        self._thread = None
+        self._thread_id = None
+        self._hook_id = None
+        self._proc = None
+
+
+class _MacOSKeyTap:
+    """Listen-only CGEventTap on a daemon thread with CFRunLoop."""
+
+    def __init__(self, on_key):
+        self._on_key = on_key
+        self._thread = None
+        self._run_loop = None
+        self._tap = None
+        self._started = threading.Event()
+        self._error = None
+
+    def start(self):
+        self._thread = threading.Thread(target=self._run, name="MacKeyTap", daemon=True)
+        self._thread.start()
+        if not self._started.wait(timeout=3.0):
+            raise RuntimeError("macOS event tap thread did not start in time")
+        if self._error is not None:
+            raise self._error
+
+    def _run(self):
+        try:
+            from Quartz import (
+                CGEventTapCreate, CGEventTapEnable,
+                CGEventGetIntegerValueField, kCGKeyboardEventKeycode,
+                kCGSessionEventTap, kCGHeadInsertEventTap, kCGEventTapOptionListenOnly,
+                kCGEventKeyDown, kCGEventTapDisabledByTimeout, kCGEventTapDisabledByUserInput,
+                CGEventMaskBit,
+            )
+            from CoreFoundation import (
+                CFRunLoopGetCurrent, CFRunLoopRun, CFRunLoopStop,
+                CFMachPortCreateRunLoopSource, kCFRunLoopCommonModes, CFRunLoopAddSource,
+            )
+        except Exception as exc:
+            self._error = exc
+            self._started.set()
+            return
+
+        def callback(proxy, event_type, event, refcon):
+            if event_type in (kCGEventTapDisabledByTimeout, kCGEventTapDisabledByUserInput):
+                CGEventTapEnable(self._tap, True)
+                return event
+            if event_type == kCGEventKeyDown:
+                keycode = CGEventGetIntegerValueField(event, kCGKeyboardEventKeycode)
+                qt_key = _mac_keycode_to_qt(keycode)
+                if qt_key is not None:
+                    self._on_key(int(qt_key))
+            return event
+
+        mask = CGEventMaskBit(kCGEventKeyDown)
+        self._tap = CGEventTapCreate(
+            kCGSessionEventTap,
+            kCGHeadInsertEventTap,
+            kCGEventTapOptionListenOnly,
+            mask,
+            callback,
+            None,
+        )
+        if self._tap is None:
+            self._error = RuntimeError(
+                "CGEventTapCreate returned None — grant Accessibility and "
+                "Input Monitoring, then restart the app.")
+            self._started.set()
+            return
+
+        self._run_loop = CFRunLoopGetCurrent()
+        source = CFMachPortCreateRunLoopSource(None, self._tap, 0)
+        CFRunLoopAddSource(self._run_loop, source, kCFRunLoopCommonModes)
+        CGEventTapEnable(self._tap, True)
+        self._started.set()
+        CFRunLoopRun()
+
+        try:
+            CGEventTapEnable(self._tap, False)
+        except Exception:
+            pass
+
+    def stop(self):
+        if self._run_loop is not None:
+            try:
+                from CoreFoundation import CFRunLoopStop
+                CFRunLoopStop(self._run_loop)
+            except Exception:
+                pass
+        if self._thread is not None and self._thread.is_alive():
+            self._thread.join(timeout=2.0)
+        self._thread = None
+        self._run_loop = None
+        self._tap = None
 
 
 class GlobalKeyListener(QObject):
     """Emits key_pressed(qt_key_code:int) for every physical key press, globally.
 
-    On macOS the OS silently drops events unless the process is a trusted
-    Accessibility / Input-Monitoring client, so we verify trust up front with
-    AXIsProcessTrusted() and prompt the user instead of pretending to work.
+    Windows: SetWindowsHookExW(WH_KEYBOARD_LL) — listen-only, does not block input.
+    macOS: CGEventTap (kCGEventTapOptionListenOnly) — requires Accessibility +
+           Input Monitoring; verified via AXIsProcessTrustedWithOptions.
+    Linux: no global capture; keys work only when this window is focused.
     """
     key_pressed = pyqtSignal(int)
     status_changed = pyqtSignal(str)
 
     def __init__(self):
         super().__init__()
-        self._listener = None
-        self._special = {}
+        self._backend = None
         self.active = False
 
     def _mac_is_trusted(self, prompt=True):
-        """Return True if this process may monitor input on macOS.
-        If prompt=True and not yet trusted, ask macOS to show the permission
-        dialog so the user can grant it."""
+        """Return True if this process may monitor input on macOS."""
         if sys.platform != "darwin":
             return True
         try:
@@ -512,68 +723,68 @@ class GlobalKeyListener(QObject):
                 from ApplicationServices import AXIsProcessTrusted
                 return bool(AXIsProcessTrusted())
             except Exception:
-                # pyobjc not available — can't verify; assume the listener may work
-                return True
+                return False
+
+    def _emit_key(self, qt_key):
+        self.key_pressed.emit(int(qt_key))
 
     def start(self):
-        try:
-            from pynput import keyboard
-        except Exception:
+        if sys.platform == "linux":
             self.status_changed.emit(
-                "Global capture off: pynput not installed. Run: pip install pynput")
+                "Linux: global capture unavailable — keys work when this window is focused.")
             self.active = False
             return False
 
-        # On macOS, verify Accessibility/Input-Monitoring trust before starting.
-        if sys.platform == "darwin" and not self._mac_is_trusted(prompt=True):
-            self.status_changed.emit(
-                "Grant access in System Settings → Privacy & Security → "
-                "Accessibility (and Input Monitoring), then reopen the app. "
-                "Until then keys work only when this window is focused.")
-            self.active = False
-            return False
-
-        self._special = {
-            keyboard.Key.space: Qt.Key.Key_Space,
-            keyboard.Key.enter: Qt.Key.Key_Return,
-            keyboard.Key.tab: Qt.Key.Key_Tab,
-        }
-
-        def on_press(key):
-            code = self._translate(key)
-            if code is not None:
-                self.key_pressed.emit(int(code))
-
-        try:
-            self._listener = keyboard.Listener(on_press=on_press)
-            self._listener.start()
-            # give the listener a moment; if it died immediately, treat as failed
-            self._listener.wait()
-            if not self._listener.running:
-                raise RuntimeError("listener did not start")
+        if sys.platform == "darwin":
+            if not self._mac_is_trusted(prompt=True):
+                self.status_changed.emit(
+                    "Grant Accessibility and Input Monitoring in System Settings → "
+                    "Privacy & Security, then restart the app. Until then keys work "
+                    "only when this window is focused.")
+                self.active = False
+                return False
+            try:
+                self._backend = _MacOSKeyTap(self._emit_key)
+                self._backend.start()
+            except Exception as exc:
+                self.active = False
+                self.status_changed.emit(
+                    f"Couldn't start macOS event tap ({exc}). Enable Accessibility "
+                    "and Input Monitoring, then restart the app.")
+                self._backend = None
+                return False
             self.active = True
-            self.status_changed.emit("Global key capture on — plays even when unfocused.")
-            return True
-        except Exception:
-            self.active = False
             self.status_changed.emit(
-                "Couldn't start global capture. On macOS allow the app in "
-                "System Settings → Privacy & Security → Input Monitoring, then reopen.")
-            return False
+                "Global key capture on (CGEventTap) — plays even when unfocused.")
+            return True
 
-    def _translate(self, key):
-        ch = getattr(key, "char", None)
-        if ch:
-            return _CHAR_TO_QT.get(ch.lower())
-        return self._special.get(key)
+        if sys.platform == "win32":
+            try:
+                self._backend = _WindowsKeyHook(self._emit_key)
+                self._backend.start()
+            except Exception as exc:
+                self.active = False
+                self.status_changed.emit(
+                    f"Couldn't start Windows keyboard hook ({exc}).")
+                self._backend = None
+                return False
+            self.active = True
+            self.status_changed.emit(
+                "Global key capture on (WH_KEYBOARD_LL) — plays even when unfocused.")
+            return True
+
+        self.status_changed.emit(
+            "Global capture unavailable on this platform — keys work when focused.")
+        self.active = False
+        return False
 
     def stop(self):
-        try:
-            if self._listener is not None:
-                self._listener.stop()
-                self._listener = None
-        except Exception:
-            pass
+        if self._backend is not None:
+            try:
+                self._backend.stop()
+            except Exception:
+                pass
+            self._backend = None
         self.active = False
 
 
@@ -609,8 +820,8 @@ class MainWindow(QWidget):
         self._restore_settings()
 
         # global keyboard listener — captures keys even when unfocused.
-        # Deferred so the window paints immediately; pynput/permission init
-        # (which can be slow on macOS) happens right after the UI is up.
+        # Deferred so the window paints immediately; native hook init happens
+        # after the UI is up.
         self.global_keys = GlobalKeyListener()
         self.global_keys.key_pressed.connect(self.handle_play_key)
         self.global_keys.status_changed.connect(self.status)

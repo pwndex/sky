@@ -22,9 +22,8 @@ a = Analysis(
     binaries=[],
     datas=[],
     hiddenimports=[
-        'pynput', 'pynput.keyboard', 'pynput.mouse',
-        # macOS trust check + window level (ignored if absent on other OSes)
-        'ApplicationServices', 'Quartz', 'AppKit', 'objc',
+        # macOS trust check, CGEventTap, window level (ignored if absent on other OSes)
+        'ApplicationServices', 'Quartz', 'CoreFoundation', 'AppKit', 'objc',
     ],
     hookspath=[],
     hooksconfig={},
@@ -55,7 +54,7 @@ exe = EXE(
     upx_exclude=[],
     console=False,               # no terminal window (GUI app)
     disable_windowed_traceback=False,
-    argv_emulation=False,        # keep off — can interfere with pynput on macOS
+    argv_emulation=False,
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
