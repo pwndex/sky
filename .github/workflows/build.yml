@@ -4,13 +4,12 @@ on:
   push:
     branches:
       - main
-  pull_request:
-    branches:
-      - main
+    tags:
+      - "v*"
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   build:
@@ -25,11 +24,9 @@ jobs:
           - macos-latest
 
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
           cache: pip
@@ -41,23 +38,30 @@ jobs:
           pip install -r requirements.txt
           pip install pyinstaller
 
-      - name: Build application
+      - name: Build
         run: pyinstaller SkyPractice.spec
 
-      - name: Upload Windows build
+      - name: Zip Windows
         if: runner.os == 'Windows'
-        uses: actions/upload-artifact@v4
-        with:
-          name: SkyPractice-Windows
-          path: dist/SkyPractice
-          if-no-files-found: error
-          retention-days: 30
+        shell: pwsh
+        run: |
+          Compress-Archive -Path dist/SkyPractice/* -DestinationPath SkyPractice-Windows.zip
 
-      - name: Upload macOS build
+      - name: Zip macOS
         if: runner.os == 'macOS'
+        run: |
+          ditto -c -k --sequesterRsrc --keepParent dist/SkyPractice.app SkyPractice-macOS.zip
+
+      - name: Upload Artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: SkyPractice-macOS
-          path: dist/SkyPractice.app
-          if-no-files-found: error
-          retention-days: 30
+          name: ${{ runner.os }}
+          path: |
+            *.zip
+
+      - name: Publish Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: "*.zip"
+          generate_release_notes: true
